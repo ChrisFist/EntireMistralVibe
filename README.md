@@ -79,6 +79,27 @@ Then enable the agent:
 entire enable --agent vibe
 ```
 
+### Recommended `.gitignore` entries
+
+Add these lines to your repository's `.gitignore`:
+
+```gitignore
+# Entire: agent discovery is configured locally, never committed
+.entire/settings.local.json
+# Integration working state (session cache, token counters) — local only
+.entire/vibe-agent-sessions/
+```
+
+Why: Entire requires the `external_agents` setting to live in the **untracked**
+`.entire/settings.local.json` on purpose — the committed `.entire/settings.json`
+cannot grant it. The integration's working state under
+`.entire/vibe-agent-sessions/` (per-session cache, token counters) is local-only
+as well and does not belong in commits.
+
+Note that checkpoint data (transcripts, tokens, file changes) is **not**
+affected by `.gitignore`: Entire stores it in git refs outside the working
+tree, so your captured sessions are safe either way.
+
 ## Verify it works
 
 ```bash
