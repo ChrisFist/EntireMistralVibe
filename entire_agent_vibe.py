@@ -635,8 +635,16 @@ def cmd_are_hooks_installed():
 
 def cmd_compact_transcript():
     # --session-ref <path> — the CLI passes a temp file with the redacted
-    # transcript (our prepared Markdown). Convert it into Entire's compact
-    # transcript JSONL (one line per message, base64-encoded in the response):
+    # transcript (our prepared Markdown). That temp file carries the FULL
+    # session history, but it can miss the most recent turn's final
+    # assistant message (Vibe flushes it to the journal only after the
+    # post_agent hook fires). The live journal always has that message, but
+    # it is a rolling window — Vibe deletes older chunks — so it can lack
+    # early turns. Strategy: parse BOTH sources and MERGE. The Markdown
+    # lines provide the complete history, the journal lines provide the
+    # complete recent tail. Fallback: treat the ref as a raw journal file.
+    # The merged result is converted into Entire's compact transcript JSONL
+    # (one line per message, base64-encoded in the response):
     #   {"v":1,"agent":"vibe","cli_version":"...","type":"user",
     #    "content":[{"text":"..."}]}
     #   {"v":1,...,"type":"assistant","content":[{"type":"text","text":"..."},
@@ -663,17 +671,78 @@ def cmd_compact_transcript():
         return {"v": 1, "agent": "vibe", "cli_version": cli_version,
                 "type": "assistant", "content": []}
 
-    lines = []
-    last_assistant = None
+    def new_converter():
+        # An independent sink for compact lines with its own tracking of
+        # the "current" assistant line (used to attach tool blocks).
+        state = {"lines": [], "last": None}
 
-    def ensure_assistant():
-        nonlocal last_assistant
-        if last_assistant is None:
-            last_assistant = new_assistant_line()
-            lines.append(last_assistant)
-        return last_assistant
+        def ensure_assistant():
+            if state["last"] is None:
+                state["last"] = new_assistant_line()
+                state["lines"].append(state["last"])
+            return state["last"]
 
-    # --- Primary: parse our prepared Markdown sections ---
+        def add_entries(chunks):
+            # Convert replayed journal entries into compact transcript lines.
+            for entry in _replay_conversation(chunks):
+                if not isinstance(entry, dict):
+                    continue
+                etype = entry.get("type")
+                if etype == "message":
+                    texts = []
+                    for part in entry.get("content") or []:
+                        if isinstance(part, dict) and (part.get("text") or "").strip():
+                            texts.append(part["text"].strip())
+                    if not texts:
+                        continue
+                    if str(entry.get("role") or "").lower() == "user":
+                        state["lines"].append(user_line("\n\n".join(texts)))
+                        state["last"] = None
+                    else:
+                        state["last"] = new_assistant_line()
+                        state["last"]["content"].append(
+                            {"type": "text", "text": "\n\n".join(texts)})
+                        state["lines"].append(state["last"])
+                elif etype == "effect":
+                    detail = entry.get("detail") or {}
+                    state_out = entry.get("state") or {}
+                    command = (detail.get("input") or {}).get("command") or ""
+                    structured = ((state_out.get("output") or {}).get("structured_content")) or {}
+                    output = state_out.get("outputText") or structured.get("stdout") or ""
+                    if not (command or output):
+                        continue
+                    block = {"type": "tool_use",
+                             "name": str(entry.get("title") or detail.get("toolName") or "tool"),
+                             "input": {"command": command}}
+                    if output:
+                        status = "error" if str(state_out.get("status") or "") == "failed" else "success"
+                        block["result"] = {"output": output, "status": status}
+                    ensure_assistant()["content"].append(block)
+
+        return state, ensure_assistant, add_entries
+
+    md_state, md_ensure, md_add = new_converter()
+    j_state, j_ensure, j_add = new_converter()
+
+    # --- Source 1: the live journal (complete recent turns) ---
+    # At checkpoint time the journal always contains the final assistant
+    # message of the latest turn. Safety: the CLI redacts the
+    # compact-transcript output again before persisting, and scopes
+    # checkpoints by leading-identical lines, so a merged full-session
+    # transcript is attributed correctly even when the journal already
+    # contains later turns.
+    m = re.search(r"Mistral Vibe session ([0-9a-fA-F-]{32,})", md)
+    if m:
+        sid = m.group(1)
+        candidates = [os.path.join(UNIFIED_DIR, sid)]
+        if os.path.isdir(path):
+            candidates.append(path)     # manual runs may pass the session dir
+        for candidate in candidates:
+            if os.path.isdir(candidate):
+                j_add(_resolve_chunks(candidate))
+                break
+
+    # --- Source 2: the prepared Markdown sections (full history) ---
     sections = []
     current = None
     for ln in md.splitlines():
@@ -690,13 +759,13 @@ def cmd_compact_transcript():
         text = "\n".join(body).strip()
         if heading == "User":
             if text:
-                lines.append(user_line(text))
-                last_assistant = None
+                md_state["lines"].append(user_line(text))
+                md_state["last"] = None
         elif heading == "Assistant":
             if text:
-                last_assistant = new_assistant_line()
-                last_assistant["content"].append({"type": "text", "text": text})
-                lines.append(last_assistant)
+                md_state["last"] = new_assistant_line()
+                md_state["last"]["content"].append({"type": "text", "text": text})
+                md_state["lines"].append(md_state["last"])
         elif heading.startswith("Tool"):
             name = heading.split(":", 1)[1].strip() if ":" in heading else "tool"
             blocks = []
@@ -717,51 +786,59 @@ def cmd_compact_transcript():
                          "input": {"command": command}}
                 if output:
                     block["result"] = {"output": output, "status": "success"}
-                ensure_assistant()["content"].append(block)
+                md_ensure()["content"].append(block)
         # Reasoning and unknown sections are intentionally skipped.
 
-    # --- Fallback: the ref may be a raw journal file instead ---
-    if not lines and os.path.isfile(path):
-        for entry in _replay_conversation([path]):
-            if not isinstance(entry, dict):
-                continue
-            etype = entry.get("type")
-            if etype == "message":
-                texts = []
-                for part in entry.get("content") or []:
-                    if isinstance(part, dict) and (part.get("text") or "").strip():
-                        texts.append(part["text"].strip())
-                if not texts:
-                    continue
-                if str(entry.get("role") or "").lower() == "user":
-                    lines.append(user_line("\n\n".join(texts)))
-                    last_assistant = None
-                else:
-                    last_assistant = new_assistant_line()
-                    last_assistant["content"].append(
-                        {"type": "text", "text": "\n\n".join(texts)})
-                    lines.append(last_assistant)
-            elif etype == "effect":
-                detail = entry.get("detail") or {}
-                state = entry.get("state") or {}
-                command = (detail.get("input") or {}).get("command") or ""
-                structured = ((state.get("output") or {}).get("structured_content")) or {}
-                output = state.get("outputText") or structured.get("stdout") or ""
-                if not (command or output):
-                    continue
-                block = {"type": "tool_use",
-                         "name": str(entry.get("title") or detail.get("toolName") or "tool"),
-                         "input": {"command": command}}
-                if output:
-                    status = "error" if str(state.get("status") or "") == "failed" else "success"
-                    block["result"] = {"output": output, "status": status}
-                ensure_assistant()["content"].append(block)
+    # --- Last resort: the ref may be a raw journal file itself ---
+    if not md_state["lines"] and not j_state["lines"] and os.path.isfile(path):
+        j_add([path])
+
+    # --- Merge: full history from Markdown + complete tail from journal ---
+    def line_sig(l):
+        # Content signature used to align the two sources: line type plus
+        # text content. Tool blocks are ignored because the same turn can
+        # carry different tool sets depending on when it was captured.
+        texts = []
+        for c in l.get("content") or []:
+            if isinstance(c, dict) and c.get("text"):
+                texts.append(c["text"])
+        return json.dumps([l.get("type"), texts], sort_keys=True)
+
+    lines_md = md_state["lines"]
+    lines_j = j_state["lines"]
+    if lines_md and lines_j:
+        j_sigs = [line_sig(l) for l in lines_j]
+        last = line_sig(lines_md[-1])
+        if last in j_sigs:
+            # The journal continues where the Markdown ends: keep the full
+            # history and append the journal's newer lines (e.g. the final
+            # assistant message the temp file was missing).
+            idx = len(j_sigs) - 1 - j_sigs[::-1].index(last)
+            lines = lines_md + lines_j[idx + 1:]
+        else:
+            # The Markdown's last line is absent from the journal — e.g. the
+            # temp file merged a turn into one section where the journal has
+            # it split into more entries. Align on the newest Markdown line
+            # that also exists in the journal and take the journal's more
+            # complete tail from there.
+            merged = None
+            for p in range(len(lines_md) - 1, -1, -1):
+                sp = line_sig(lines_md[p])
+                if sp in j_sigs:
+                    q = len(j_sigs) - 1 - j_sigs[::-1].index(sp)
+                    merged = lines_md[:p] + lines_j[q:]
+                    break
+            # No overlap at all (disjoint captures): concatenate both.
+            lines = merged if merged is not None else lines_md + lines_j
+    else:
+        lines = lines_j or lines_md
 
     if not lines:
         sys.stderr.write("compact-transcript: no conversation content found\n")
         sys.exit(1)
 
     payload = "".join(json.dumps(l) + "\n" for l in lines)
+    out({"transcript": base64.b64encode(payload.encode("utf-8")).decode("ascii")})
     out({"transcript": base64.b64encode(payload.encode("utf-8")).decode("ascii")})
 
 
@@ -823,6 +900,46 @@ def _replay_conversation(chunks):
     return state_entries
 
 
+def _journal_total_size(session_ref):
+    # Total byte size of all journal chunk files for a session ref. Used by
+    # the quiescence wait to detect that Vibe has finished flushing the
+    # turn's final records to disk.
+    total = 0
+    for chunk in _resolve_chunks(session_ref):
+        try:
+            total += os.path.getsize(chunk)
+        except OSError:
+            pass
+    return total
+
+
+def _wait_for_journal_quiescence(session_ref, max_wait=4.0, poll=0.25,
+                                 stable_for=0.5):
+    # Vibe's post_agent hook fires BEFORE the turn's final assistant message
+    # is appended to the journal (observed: hook at record N, final assistant
+    # append_entry a few records later). Reading the journal immediately can
+    # therefore miss the very response the user just saw. Poll the journal
+    # size until it stops growing, so prepare-transcript captures the full
+    # turn. On a static journal this costs roughly `stable_for` seconds once.
+    deadline = time.time() + max_wait
+    last_size = -1
+    stable_since = None
+    while time.time() < deadline:
+        try:
+            size = _journal_total_size(session_ref)
+        except OSError:
+            return
+        if size == last_size:
+            if stable_since is None:
+                stable_since = time.time()
+            if time.time() - stable_since >= stable_for:
+                return
+        else:
+            last_size = size
+            stable_since = None
+        time.sleep(poll)
+
+
 def cmd_prepare_transcript():
     # --session-ref <path>
     # Convert Vibe's recovery journal into a readable Markdown transcript so
@@ -843,6 +960,9 @@ def cmd_prepare_transcript():
     #             state.output.structured_content.stdout
     #   notice    transient bookkeeping (removed again via remove_entry)
     session_ref = arg_value("--session-ref") or ""
+    # Wait for the journal to settle first: the final assistant message of
+    # the turn is flushed shortly AFTER the hook fires.
+    _wait_for_journal_quiescence(session_ref)
     chunks = _resolve_chunks(session_ref)
     if not chunks:
         sys.stderr.write("prepare-transcript: no journal chunks found\n")

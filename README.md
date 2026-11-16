@@ -14,10 +14,10 @@ when the binary is on your `PATH` under the name `entire-agent-vibe`.
 | Capability | What it does |
 |---|---|
 | `hooks` | Vibe's `post_agent` hook maps to Entire's TurnEnd event, so every completed turn becomes a checkpoint opportunity. |
-| `transcript_preparer` | Replays Vibe's recovery journal (`projection_delta` append/replace/remove ops) into a readable Markdown transcript — user prompts, assistant responses, reasoning, and tool calls with command and output. |
+| `transcript_preparer` | Replays Vibe's recovery journal (`projection_delta` append/replace/remove ops) into a readable Markdown transcript — user prompts, assistant responses, reasoning, and tool calls with command and output. Waits briefly for the journal to settle so the turn's final response is always captured. |
 | `transcript_analyzer` | Tracks the journal position and extracts modified files (Git-confirmed: only files actually changed in the worktree are reported). |
 | `token_calculator` | Reports **per-turn token deltas** from Vibe's cumulative `tokenUsage`, with a fallback that reads usage straight from the journal. |
-| `compact_transcript` | Converts the transcript into Entire's compact transcript JSONL (`transcript.jsonl`), which is what the Entire dashboard renders as Prompts / Responses / Tool calls. |
+| `compact_transcript` | Converts the transcript into Entire's compact transcript JSONL (`transcript.jsonl`), which is what the Entire dashboard renders as Prompts / Responses / Tool calls. Merges the stored transcript (full history) with the live journal (complete recent turns), so nothing is lost at either end. |
 
 ## How it works
 
@@ -31,6 +31,23 @@ removed, and stores a prepared sidecar (`.prepared.md`) next to each chunk.
 At checkpoint time, Entire feeds the stored transcript back through
 `compact-transcript`, which converts it into the compact JSONL format the
 dashboard understands.
+
+### Turn-end timing and how it is handled
+
+Vibe's `post_agent` hook fires **before** the turn's final assistant message
+is appended to the journal. Two safeguards make sure that message still ends
+up in every checkpoint:
+
+1. **Journal quiescence wait** — `prepare-transcript` polls the journal until
+   its size stops growing (a fraction of a second, capped at a few seconds),
+   then replays it. Turn end therefore takes roughly one extra second, and
+   the final response is always captured.
+2. **Two-source merge** — `compact-transcript` merges the stored transcript
+   with the live journal: the stored transcript carries the **full session
+   history** (the journal is a rolling window — Vibe deletes older chunks),
+   while the live journal carries the **complete recent turns** including the
+   final response, which the stored snapshot can miss. Older journal chunks
+   being deleted over time is exactly why neither source alone is sufficient.
 
 ## Requirements
 
@@ -128,6 +145,13 @@ Common checks:
   exactly `entire-agent-vibe` and it responds to `entire-agent-vibe info`.
 - **No transcripts appear** — complete a full turn (the hook fires on turn
   end), and confirm Vibe's journal exists under `~/.vibe/logs/session/unified/`.
+- **The last response of a turn is missing or truncated on the dashboard** —
+  Vibe's turn-end hook fires before the final response is flushed to the
+  journal. The current version waits for the journal to settle and merges the
+  live journal into the compact transcript, so new turns are captured
+  completely. If you see this, make sure the deployed script is the latest
+  version and complete a **new** turn: already-stored checkpoints are not
+  rewritten retroactively.
 - **Token totals look too high or too low** — token usage is read from the
   journal at turn end; a turn that is still running reports the previous
   cumulative state.
@@ -138,7 +162,8 @@ Tested with:
 
 - Mistral Vibe Code 1.27.0 (`mistral-vibe-vscode`), recovery journal record
   version 1
-- Entire CLI Agent Integration Protocol, protocol version 1
+- Entire CLI Agent Integration Protocol, protocol version 1 (tested with
+  Entire CLI 0.12.2)
 
 Vibe's journal format is not a documented public contract; if a future Vibe
 release changes its record structure, `prepare-transcript` and
