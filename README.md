@@ -178,6 +178,34 @@ release changes its record structure, `prepare-transcript` and
 - This integration only reads local files under `~/.vibe` and the current
   repository, and makes no network calls.
 
+## Glossary
+
+Terms used above that are common when building AI agent environments, but
+not everyone knows.
+
+| Term | Meaning |
+|---|---|
+| Session | One continuous conversation between you and the agent, tied to a working directory. Identified by a UUID, with its own start time, model, and cumulative token counter. Vibe stores it under `~/.vibe/logs/session/unified/<session-uuid>/`. |
+| Turn | One round of a session: a single user prompt plus everything the agent does in response — reasoning, tool calls, and the final answer. The turn ends when the agent finishes responding; that is when Vibe fires the `post_agent` hook. |
+| Hook | A command Vibe runs at defined moments, declared in `.vibe/hooks.toml` (`pre_tool`, `post_tool`, `post_agent`). The hook receives a JSON payload on stdin (`session_id`, `transcript_path`, `cwd`, `hook_event_name`, ...). This integration bridges `post_agent` to Entire's TurnEnd event. |
+| Recovery journal | Vibe's append-only log of a session: JSONL files at `~/.vibe/logs/session/unified/<id>/journal/*.jsonl`, one JSON record per line (`core_input`, `projection_delta`, `action_intent`, `action_result`, `callback_*`, `receipt_*`). It is the source of truth for what happened in the session. |
+| Projection delta | `projection_delta` records that describe updates to the canonical conversation state via ops: `append_entry`, `replace_entry`, `remove_entry`, `set_envelope`. Replaying all deltas in order rebuilds the conversation — that is how `prepare-transcript` produces the transcript. |
+| Rolling window (compaction) | The journal is not kept forever: Vibe compacts it and deletes older chunks as the session grows. This is why the transcript is captured at turn end, and why neither the stored transcript nor the live journal is complete on its own. |
+| Journal quiescence | `post_agent` fires slightly before the turn's final assistant message is flushed to the journal, so `prepare-transcript` polls the journal's total size until it stops growing before reading it. |
+| Transcript | The human-readable Markdown rendering of a session — the `.prepared.md` sidecar written next to the journal chunk, with `## User`, `## Assistant`, and `## Tool: <name>` sections. |
+| Compact transcript | Entire's dashboard format (`transcript.jsonl`): one JSON object per message — `type: "user"` or `"assistant"` with `text` and `tool_use` content blocks — produced by `compact-transcript` and base64-encoded in protocol responses. |
+| Checkpoint | Entire's snapshot of an agent session, attached to a git commit and stored in Entire's own git refs outside the working tree, so `.gitignore` never affects it. Rendered on the Entire dashboard next to the commit. |
+| Agent Integration Protocol | Entire's protocol (here `protocol_version 1`) for external agents: Entire discovers a binary on `PATH` (here `entire-agent-vibe`), reads its `info` capabilities, and drives it through subcommands that pass JSON on stdin and return JSON on stdout. |
+| Capability | A feature an integration advertises in `info` — `hooks`, `transcript_preparer`, `transcript_analyzer`, `token_calculator`, `compact_transcript`, ... Entire only calls the subcommands behind advertised capabilities. |
+| Lifecycle event | Entire's session event types: 1 SessionStart, 2 TurnStart, 3 TurnEnd, 4 Compaction, 5 SessionEnd. `parse-hook` maps Vibe's `post_agent` to type 3 (TurnEnd). |
+| AgentSession | Entire's per-session state object (`session_id`, `repo_path`, `session_ref`, `modified_files`, `new_files`, `deleted_files`, `transcript_position`, ...), persisted by this integration under `.entire/vibe-agent-sessions/`. |
+| Session ref / transcript position | Pointers into the session data: a path to a journal chunk or session directory, plus a byte offset into it. The byte offset doubles as the resume position (`vibe --resume <session-id>`). |
+| Token usage | Vibe records `tokenUsage` (input/output/total tokens) cumulatively for the whole session. Entire sums per-turn values, so this integration remembers the previous cumulative total and reports only the per-turn delta. |
+| Tool call (effect) | One agent action, e.g. running a shell command. In the journal it is an `effect` entry (`detail.input.command`, `state.outputText`); in the compact transcript a `tool_use` block with command and result. |
+| Reasoning | The model's internal thinking text (journal `reasoning` entries). Deliberately omitted from the compact transcript. |
+| Redaction | Entire strips detected secrets from transcripts before persisting a checkpoint. |
+| JSONL | Newline-delimited JSON — one JSON object per line. Used for the journal files and for `transcript.jsonl`. |
+
 ## License
 
 Released under the **MIT License** — see [`LICENSE`](LICENSE).
